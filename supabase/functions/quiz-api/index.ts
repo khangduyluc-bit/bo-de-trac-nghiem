@@ -187,6 +187,23 @@ async function handle(req: Request): Promise<Response> {
     await db(`tests?id=eq.${id}`, { method: "DELETE", headers: { Prefer: "return=minimal" } });
     return reply({ success: true });
   }
+  if (route === "/api/check-answer" && req.method === "POST") {
+    const input = await body(req);
+    const testId = String(input.testId || "");
+    const questionId = String(input.questionId || "");
+    const answer = String(input.answer || "").toUpperCase();
+    if (!uuidRe.test(testId)) return reply({ error: "Mã đề không hợp lệ." }, 400);
+    if (!/^\d{1,4}$/.test(questionId) || !["A", "B", "C", "D"].includes(answer))
+      return reply({ error: "Lựa chọn đáp án không hợp lệ." }, 400);
+    const rows = await db(`tests?select=questions,is_public&id=eq.${testId}&limit=1`);
+    if (!rows?.length || (!rows[0].is_public && !await teacher(req, cfg)))
+      return reply({ error: "Không tìm thấy đề thi." }, 404);
+    const question = rows[0].questions?.[questionId];
+    if (!question || !["A", "B", "C", "D"].includes(String(question.answer || "").toUpperCase()))
+      return reply({ error: "Không tìm thấy câu hỏi hoặc đáp án." }, 404);
+    const correctAnswer = String(question.answer).toUpperCase();
+    return reply({ isCorrect: answer === correctAnswer, correctAnswer });
+  }
   if (route === "/api/submit" && req.method === "POST") {
     const input = await body(req), testId = String(input.testId || ""), studentName = String(input.studentName || "").trim().replace(/\s+/g, " ").slice(0, 100), answers = input.answers;
     if (!uuidRe.test(testId)) return reply({ error: "Mã đề không hợp lệ." }, 400);
