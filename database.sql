@@ -11,10 +11,13 @@ create table if not exists public.results (
   id uuid primary key default gen_random_uuid(),
   test_id uuid not null references public.tests(id) on delete cascade,
   student_name text not null,
+  student_phone text,
   score integer not null check (score >= 0),
   total integer not null check (total > 0 and score <= total),
   submitted_at timestamptz not null default now()
 );
+
+alter table public.results add column if not exists student_phone text;
 
 create table if not exists public.app_config (
   id integer primary key default 1 check (id = 1),
