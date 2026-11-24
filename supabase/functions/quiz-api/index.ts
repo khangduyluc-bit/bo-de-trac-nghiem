@@ -74,6 +74,12 @@ async function passwordMatches(value: string, salt: string, expectedHash: string
 async function passwordOK(value: string, cfg: Awaited<ReturnType<typeof config>>) {
   return passwordMatches(value, cfg.teacher_salt, cfg.teacher_hash);
 }
+async function makePasswordHash(value: string) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", enc.encode(value), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" }, key, 256));
+  return { salt: encode64(salt), hash: encode64(bits) };
+}
 async function token(exp: number, secret: string, purpose: "teacher" | "site" = "teacher") {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   // Keep teacher-token signing compatible with existing live teacher sessions.
@@ -141,6 +147,14 @@ async function handle(req: Request): Promise<Response> {
     return reply({ isTeacher: await teacher(req, cfg) });
   }
   if (route === "/api/teacher/logout" && req.method === "POST") return reply({ success: true });
+  if (route === "/api/site/passcode" && req.method === "POST") {
+    if (!await teacher(req, cfg)) return reply({ error: "Chỉ giáo viên đã đăng nhập mới được đổi mã truy cập." }, 401);
+    const input = await body(req), passcode = String(input.passcode || "");
+    if (passcode.length < 4 || passcode.length > 64) return reply({ error: "Mã truy cập cần có từ 4 đến 64 ký tự." }, 400);
+    const hashed = await makePasswordHash(passcode);
+    await db("app_config?id=eq.1", { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ site_passcode_salt: hashed.salt, site_passcode_hash: hashed.hash, updated_at: new Date().toISOString() }) });
+    return reply({ success: true });
+  }
 
   if (route === "/api/tests" && req.method === "GET") {
     const isTeacher = await teacher(req, cfg);
@@ -167,7 +181,8 @@ async function handle(req: Request): Promise<Response> {
     for (const [qid, q] of entries) {
       const opts = q?.options && typeof q.options === "object" && !Array.isArray(q.options) ? Object.keys(q.options) : [];
       if (!/^\d{1,4}$/.test(qid) || !q || typeof q.text !== "string" || q.text.length > 20000 || !q.options || Array.isArray(q.options) ||
-        !["A", "B", "C", "D"].includes(q.answer) || !q.options[q.answer] || opts.length < 2 || opts.some(k => !["A", "B", "C", "D"].includes(k) || typeof q.options[k] !== "string" || q.options[k].length > 10000))
+        !["A", "B", "C", "D"].includes(q.answer) || !q.options[q.answer] || opts.length < 2 || opts.some(k => !["A", "B", "C", "D"].includes(k) || typeof q.options[k] !== "string" || q.options[k].length > 10000) ||
+        (q.explanation !== undefined && (typeof q.explanation !== "string" || q.explanation.length > 8000)))
         return reply({ error: `Dữ liệu câu ${qid} chưa hợp lệ.` }, 400);
     }
     const inserted = await db("tests?select=id", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ name, questions: qs, is_public: isPublic }]) });
@@ -202,27 +217,30 @@ async function handle(req: Request): Promise<Response> {
     if (!question || !["A", "B", "C", "D"].includes(String(question.answer || "").toUpperCase()))
       return reply({ error: "Không tìm thấy câu hỏi hoặc đáp án." }, 404);
     const correctAnswer = String(question.answer).toUpperCase();
-    return reply({ isCorrect: answer === correctAnswer, correctAnswer });
+    const explanation = typeof question.explanation === "string" ? question.explanation.slice(0, 8000) : "";
+    return reply({ isCorrect: answer === correctAnswer, correctAnswer, explanation });
   }
   if (route === "/api/submit" && req.method === "POST") {
-    const input = await body(req), testId = String(input.testId || ""), studentName = String(input.studentName || "").trim().replace(/\s+/g, " ").slice(0, 100), answers = input.answers;
+    const input = await body(req), testId = String(input.testId || ""), studentName = String(input.studentName || "").trim().replace(/\s+/g, " ").slice(0, 100), studentPhone = String(input.studentPhone || "").trim().slice(0, 24), answers = input.answers;
     if (!uuidRe.test(testId)) return reply({ error: "Mã đề không hợp lệ." }, 400);
     if (!studentName) return reply({ error: "Vui lòng nhập họ và tên." }, 400);
+    if (studentPhone && !/^[0-9+() .-]{7,24}$/.test(studentPhone)) return reply({ error: "Số điện thoại chưa đúng định dạng." }, 400);
     if (!answers || typeof answers !== "object" || Array.isArray(answers)) return reply({ error: "Câu trả lời không hợp lệ." }, 400);
     const rows = await db(`tests?select=id,questions,is_public&id=eq.${testId}&limit=1`);
     if (!rows?.length || (!rows[0].is_public && !await teacher(req, cfg))) return reply({ error: "Không tìm thấy đề thi." }, 404);
     const qs = rows[0].questions || {}, ids = Object.keys(qs); let score = 0;
     for (const qid of ids) if (answers[qid] && answers[qid] === qs[qid].answer) score++;
     const total = ids.length;
-    const saved = await db("results?select=score,total,submitted_at", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ test_id: testId, student_name: studentName, score, total }]) });
+    const saved = await db("results?select=score,total,submitted_at", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ test_id: testId, student_name: studentName, student_phone: studentPhone || null, score, total }]) });
     return reply({ score: saved[0].score, total: saved[0].total, percent: total ? Math.round(score / total * 100) : 0 }, 201);
   }
   if (route === "/api/leaderboard" && req.method === "GET") {
     if (!id || !uuidRe.test(id)) return reply({ error: "Mã đề không hợp lệ." }, 400);
     const tests = await db(`tests?select=name,is_public&id=eq.${id}&limit=1`);
     if (!tests?.length || (!tests[0].is_public && !await teacher(req, cfg))) return reply({ error: "Không tìm thấy đề thi." }, 404);
-    const results = await db(`results?select=student_name,score,total,submitted_at&test_id=eq.${id}&order=score.desc,submitted_at.asc&limit=1000`);
-    return reply({ testName: tests[0].name, results: (results || []).map((r: any) => ({ studentName: r.student_name, score: r.score, total: r.total, submittedAt: r.submitted_at })) });
+    const isTeacher = await teacher(req, cfg);
+    const results = await db(`results?select=student_name,student_phone,score,total,submitted_at&test_id=eq.${id}&order=score.desc,submitted_at.asc&limit=1000`);
+    return reply({ testName: tests[0].name, results: (results || []).map((r: any) => ({ studentName: r.student_name, ...(isTeacher ? { studentPhone: r.student_phone || "" } : {}), score: r.score, total: r.total, submittedAt: r.submitted_at })) });
   }
   return reply({ error: "Không tìm thấy API." }, 404);
 }
