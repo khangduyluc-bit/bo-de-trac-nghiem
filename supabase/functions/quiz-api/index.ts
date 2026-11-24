@@ -61,6 +61,16 @@ function encode64(value: Uint8Array) {
   let b = ""; for (const x of value) b += String.fromCharCode(x);
   return btoa(b).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
+function numericValue(value: unknown): number | null {
+  const raw = String(value ?? "").trim().replace(/\s+/g, "").replace(",", ".");
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(raw)) return null;
+  const number = Number(raw);
+  return Number.isFinite(number) ? number : null;
+}
+function sameNumber(left: unknown, right: unknown): boolean {
+  const a = numericValue(left), b = numericValue(right);
+  return a !== null && b !== null && Math.abs(a - b) <= Math.max(1, Math.abs(a), Math.abs(b)) * 1e-10;
+}
 function equal(a: Uint8Array, b: Uint8Array) {
   if (a.length !== b.length) return false;
   let diff = 0; for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
@@ -163,7 +173,10 @@ async function handle(req: Request): Promise<Response> {
       const rows = await db(`tests?select=id,name,questions,is_public&id=eq.${id}&limit=1`);
       if (!rows?.length || (!rows[0].is_public && !isTeacher)) return reply({ error: "Không tìm thấy đề thi." }, 404);
       const safe: Record<string, unknown> = {};
-      for (const [qid, q] of Object.entries(rows[0].questions || {}) as [string, any][]) safe[qid] = { text: q.text, options: q.options };
+      for (const [qid, q] of Object.entries(rows[0].questions || {}) as [string, any][]) {
+        const type = q?.type === "ds" || q?.type === "tln" ? q.type : "mcq";
+        safe[qid] = { type, text: q.text, ...(type === "ds" ? { statements: q.statements } : type === "mcq" ? { options: q.options } : {}) };
+      }
       return reply({ test: { id: rows[0].id, name: rows[0].name, isPublic: !!rows[0].is_public, questions: safe } });
     }
     const visibilityFilter = isTeacher ? "" : "&is_public=eq.true";
@@ -179,11 +192,26 @@ async function handle(req: Request): Promise<Response> {
     const entries = Object.entries(qs) as [string, any][];
     if (entries.length > 500) return reply({ error: "Mỗi đề không được vượt quá 500 câu." }, 400);
     for (const [qid, q] of entries) {
-      const opts = q?.options && typeof q.options === "object" && !Array.isArray(q.options) ? Object.keys(q.options) : [];
-      if (!/^\d{1,4}$/.test(qid) || !q || typeof q.text !== "string" || q.text.length > 20000 || !q.options || Array.isArray(q.options) ||
-        !["A", "B", "C", "D"].includes(q.answer) || !q.options[q.answer] || opts.length < 2 || opts.some(k => !["A", "B", "C", "D"].includes(k) || typeof q.options[k] !== "string" || q.options[k].length > 10000) ||
+      if (!/^\d{1,4}$/.test(qid) || !q || typeof q.text !== "string" || q.text.length > 20000 ||
         (q.explanation !== undefined && (typeof q.explanation !== "string" || q.explanation.length > 8000)))
         return reply({ error: `Dữ liệu câu ${qid} chưa hợp lệ.` }, 400);
+      const type = q.type === "ds" || q.type === "tln" ? q.type : "mcq";
+      if (type === "ds") {
+        const keys = ["a", "b", "c", "d"].filter(key => typeof q.statements?.[key] === "string" && q.statements[key].trim());
+        if (!keys.length || keys.some(key => q.statements[key].length > 10000) ||
+          !q.answer || typeof q.answer !== "object" || Array.isArray(q.answer) ||
+          keys.some(key => typeof q.answer[key] !== "boolean"))
+          return reply({ error: `Câu Đúng/Sai ${qid} cần có nội dung và đáp án Đúng/Sai cho từng ý.` }, 400);
+      } else if (type === "tln") {
+        if (numericValue(q.answer) === null)
+          return reply({ error: `Câu trả lời ngắn ${qid} cần có đáp án dạng số.` }, 400);
+      } else {
+        const opts = q?.options && typeof q.options === "object" && !Array.isArray(q.options) ? Object.keys(q.options) : [];
+        if (!q.options || Array.isArray(q.options) || !["A", "B", "C", "D"].includes(q.answer) ||
+          !q.options[q.answer] || opts.length < 2 ||
+          opts.some(k => !["A", "B", "C", "D"].includes(k) || typeof q.options[k] !== "string" || q.options[k].length > 10000))
+          return reply({ error: `Câu trắc nghiệm ${qid} cần có ít nhất hai lựa chọn và đáp án A–D hợp lệ.` }, 400);
+      }
     }
     const inserted = await db("tests?select=id", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ name, questions: qs, is_public: isPublic }]) });
     return reply({ id: inserted[0].id }, 201);
@@ -206,19 +234,33 @@ async function handle(req: Request): Promise<Response> {
     const input = await body(req);
     const testId = String(input.testId || "");
     const questionId = String(input.questionId || "");
-    const answer = String(input.answer || "").toUpperCase();
     if (!uuidRe.test(testId)) return reply({ error: "Mã đề không hợp lệ." }, 400);
-    if (!/^\d{1,4}$/.test(questionId) || !["A", "B", "C", "D"].includes(answer))
-      return reply({ error: "Lựa chọn đáp án không hợp lệ." }, 400);
+    if (!/^\d{1,4}$/.test(questionId)) return reply({ error: "Mã câu hỏi không hợp lệ." }, 400);
     const rows = await db(`tests?select=questions,is_public&id=eq.${testId}&limit=1`);
     if (!rows?.length || (!rows[0].is_public && !await teacher(req, cfg)))
       return reply({ error: "Không tìm thấy đề thi." }, 404);
     const question = rows[0].questions?.[questionId];
-    if (!question || !["A", "B", "C", "D"].includes(String(question.answer || "").toUpperCase()))
-      return reply({ error: "Không tìm thấy câu hỏi hoặc đáp án." }, 404);
-    const correctAnswer = String(question.answer).toUpperCase();
+    if (!question) return reply({ error: "Không tìm thấy câu hỏi hoặc đáp án." }, 404);
+    const type = question.type === "ds" || question.type === "tln" ? question.type : "mcq";
     const explanation = typeof question.explanation === "string" ? question.explanation.slice(0, 8000) : "";
-    return reply({ isCorrect: answer === correctAnswer, correctAnswer, explanation });
+    if (type === "ds") {
+      const statementId = String(input.statementId || "").toLowerCase();
+      if (!["a", "b", "c", "d"].includes(statementId) || typeof input.answer !== "boolean" ||
+        typeof question.answer?.[statementId] !== "boolean")
+        return reply({ error: "Lựa chọn Đúng/Sai không hợp lệ." }, 400);
+      const correctAnswer = question.answer[statementId];
+      return reply({ kind: "ds", statementId, isCorrect: input.answer === correctAnswer, correctAnswer, explanation });
+    }
+    if (type === "tln") {
+      if (numericValue(input.answer) === null || numericValue(question.answer) === null)
+        return reply({ error: "Câu trả lời phải là một số hợp lệ." }, 400);
+      return reply({ kind: "tln", isCorrect: sameNumber(input.answer, question.answer), correctAnswer: String(question.answer), explanation });
+    }
+    const answer = String(input.answer || "").toUpperCase();
+    if (!["A", "B", "C", "D"].includes(answer) || !["A", "B", "C", "D"].includes(String(question.answer || "").toUpperCase()))
+      return reply({ error: "Lựa chọn đáp án không hợp lệ." }, 400);
+    const correctAnswer = String(question.answer).toUpperCase();
+    return reply({ kind: "mcq", isCorrect: answer === correctAnswer, correctAnswer, explanation });
   }
   if (route === "/api/submit" && req.method === "POST") {
     const input = await body(req), testId = String(input.testId || ""), studentName = String(input.studentName || "").trim().replace(/\s+/g, " ").slice(0, 100), studentPhone = String(input.studentPhone || "").trim().slice(0, 24), answers = input.answers;
@@ -229,7 +271,16 @@ async function handle(req: Request): Promise<Response> {
     const rows = await db(`tests?select=id,questions,is_public&id=eq.${testId}&limit=1`);
     if (!rows?.length || (!rows[0].is_public && !await teacher(req, cfg))) return reply({ error: "Không tìm thấy đề thi." }, 404);
     const qs = rows[0].questions || {}, ids = Object.keys(qs); let score = 0;
-    for (const qid of ids) if (answers[qid] && answers[qid] === qs[qid].answer) score++;
+    for (const qid of ids) {
+      const question = qs[qid], submitted = answers[qid];
+      const type = question?.type === "ds" || question?.type === "tln" ? question.type : "mcq";
+      if (type === "ds") {
+        const keys = ["a", "b", "c", "d"].filter(key => typeof question.statements?.[key] === "string" && question.statements[key].trim());
+        if (keys.length && keys.every(key => typeof submitted?.[key] === "boolean" && submitted[key] === question.answer?.[key])) score++;
+      } else if (type === "tln") {
+        if (sameNumber(submitted, question.answer)) score++;
+      } else if (typeof submitted === "string" && submitted.toUpperCase() === String(question.answer || "").toUpperCase()) score++;
+    }
     const total = ids.length;
     const saved = await db("results?select=score,total,submitted_at", { method: "POST", headers: { Prefer: "return=representation" }, body: JSON.stringify([{ test_id: testId, student_name: studentName, student_phone: studentPhone || null, score, total }]) });
     return reply({ score: saved[0].score, total: saved[0].total, percent: total ? Math.round(score / total * 100) : 0 }, 201);
